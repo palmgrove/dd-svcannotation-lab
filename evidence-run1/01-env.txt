@@ -1,0 +1,41 @@
+DCA_POD=datadog-agent-cluster-agent-67d55b75f4-kzsxb
+AGENT_POD=datadog-agent-hpfcc
+=== datadog-cluster-agent env (selected) ===
+true
+kube_endpoints kube_services
+kube_endpoints kube_services
+token_len=33
+
+=== node agent env (selected) ===
+clusterchecks endpointschecks
+token_len=33
+
+=== node agent identity ===
+uid=0(root) gid=0(root) groups=0(root)
+
+=== node agent hostPID / host mounts ===
+true
+proc /host/proc proc ro,relatime 0 0
+systemd-1 /host/proc/sys/fs/binfmt_misc autofs rw,relatime,fd=27,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=21794 0 0
+overlay /etc/passwd overlay ro,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/86/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/85/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/84/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/88/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/88/work,nouserxattr 0 0
+overlay /host/etc/os-release overlay ro,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/86/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/85/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/84/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/88/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/88/work,nouserxattr 0 0
+tmpfs /host/var/run tmpfs ro,relatime,mode=755,inode64 0 0
+tmpfs /host/var/run/lock tmpfs rw,nosuid,nodev,noexec,relatime,size=5120k,inode64 0 0
+ramfs /host/var/run/credentials/systemd-sysctl.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+ramfs /host/var/run/credentials/systemd-sysusers.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+ramfs /host/var/run/credentials/systemd-tmpfiles-setup-dev.service ramfs ro,nosuid,nodev,noexec,relatime,mode=700 0 0
+shm /host/var/run/containerd/io.containerd.grpc.v1.cri/sandboxes/f869f244a2290ebfcce7cfc70216418222af820a2ef4452ab8b7c8997461c73c/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k,inode64 0 0
+shm /host/var/run/containerd/io.containerd.grpc.v1.cri/sandboxes/7bd32139ef7fd12492b3a35241bb91f9be9c3d5dec0053bd4321aa976c9bd02a/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k,inode64 0 0
+overlay /host/var/run/containerd/io.containerd.runtime.v2.task/k8s.io/f869f244a2290ebfcce7cfc70216418222af820a2ef4452ab8b7c8997461c73c/rootfs overlay rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/3/work,uuid=on,nouserxattr 0 0
+overlay /host/var/run/containerd/io.containerd.runtime.v2.task/k8s.io/7bd32139ef7fd12492b3a35241bb91f9be9c3d5dec0053bd4321aa976c9bd02a/rootfs overlay rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/4/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/4/work,uuid=on,nouserxattr 0 0
+overlay /host/var/run/containerd/io.containerd.runtime.v2.task/k8s.io/1f041f99f5b97d3256e0c513dbf8d27af9b7595495ea2aa1fa582bf02ca496f6/rootfs overlay rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/6/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/5/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/8/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/8/work,uuid=on,nouserxattr 0 0
+overlay /host/var/run/containerd/io.containerd.runtime.v2.task/k8s.io/d1565251650dc06772aca231d4b0397a8ef830030cc0bae6b81fbd5be1ed24f4/rootfs overlay rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/11/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/10/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/9/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/7/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/12/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/12/work,uuid=on,nouserxattr 0 0
+shm /host/var/run/containerd/io.containerd.grpc.v1.cri/sandboxes/c91143ee7747d6bb6bb0e029422abb901035ddf2b23d2efcdf66978536f0cd05/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k,inode64 0 0
+nsfs /host/var/run/netns/cni-fb6e35f7-1760-ce3c-4ab3-d1db40ac8a24 nsfs rw 0 0
+overlay /host/var/run/containerd/io.containerd.runtime.v2.task/k8s.io/c91143ee7747d6bb6bb0e029422abb901035ddf2b23d2efcdf66978536f0cd05/rootfs overlay rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/1/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/13/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/13/work,uuid=on,nouserxattr 0 0
+overlay /host/var/run/containerd/io.containerd.runtime.v2.task/k8s.io/1a20792f51d4fad565b447c8dd215b2e81f4ed75ff658b864bde6c8e2409e150/rootfs overlay rw,relatime,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/16/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/15/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/14/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/17/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/17/work,uuid=on,nouserxattr 0 0
+shm /host/var/run/containerd/io.containerd.grpc.v1.cri/sandboxes/ea4025049a4849cb6e004413c1065028cee719efa4b0f20571876ab16487aa02/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k,inode64 0 0
+
+=== jmxfetch jar / java presence (standard image) ===
+ls: cannot access '/opt/datadog-agent/bin/agent/dist/jmx/jmxfetch.jar': No such file or directory
+lrwxrwxrwx 1 root root 4 Mar 31  2024 /bin/sh -> dash

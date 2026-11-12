@@ -1,0 +1,9 @@
+NAME             TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+service/ep-svc   ClusterIP   10.96.75.227   <none>        80/TCP    3m3s
+
+NAME            READY   STATUS    RESTARTS   AGE
+pod/ep-target   1/1     Running   0          3m4s
+pod/pod-ann     1/1     Running   0          92s
+
+NAME               ENDPOINTS       AGE
+endpoints/ep-svc   10.244.1.7:80   3m3s

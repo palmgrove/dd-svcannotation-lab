@@ -1,0 +1,4 @@
+kind v0.27.0 go1.23.6 linux/amd64
+Client Version: v1.32.0
+Kustomize Version: v5.5.0
+version.BuildInfo{Version:"v3.22.1", GitCommit:"d6c1a0e4027caa6abc7892e7ea9f0cda7447baa3", GitTreeState:"clean", GoVersion:"go1.26.9"}

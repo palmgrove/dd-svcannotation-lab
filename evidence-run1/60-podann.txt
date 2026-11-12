@@ -1,0 +1,7 @@
+=== node agent JMX log (pod annotation control) ===
+2026-11-12 23:36:57 UTC | CORE | DEBUG | (pkg/jmxfetch/scheduler.go:58 in Schedule) | Scheduling jmxfetch config: jmx_910c9429d970e97d: "check_name: jmx\ninit_config: {}\ninstances:\n    - java_bin_path: /bin/sh\n      java_options: -c id>/tmp/svc-ann-marker-pod\n      loader: jmx\n      tags:\n        - image_id:********@sha256:7031c1b283388d2c2e09b57badb803c05ebed362dc88d84b480cc47f72a21097\n        - image_name:registry.k8s.io/pause\n        - image_tag:3.9\n        - kube_container_name:podann\n        - kube_namespace:tenant-a\n        - kube_qos:BestEffort\n        - pod_phase:running\n        - short_image:pause\nlogs_config: null\n"
+
+=== marker (pod annotation control) ===
+ls: cannot access '/tmp/svc-ann-marker-pod': No such file or directory
+---
+cat: /tmp/svc-ann-marker-pod: No such file or directory

@@ -1,0 +1,66 @@
+=== svc-author full permission list in tenant-a ===
+Resources                                       Non-Resource URLs                      Resource Names   Verbs
+services                                        []                                     []               [create]
+selfsubjectreviews.authentication.k8s.io        []                                     []               [create]
+selfsubjectaccessreviews.authorization.k8s.io   []                                     []               [create]
+selfsubjectrulesreviews.authorization.k8s.io    []                                     []               [create]
+                                                [/.well-known/openid-configuration/]   []               [get]
+                                                [/.well-known/openid-configuration]    []               [get]
+                                                [/api/*]                               []               [get]
+                                                [/api]                                 []               [get]
+                                                [/apis/*]                              []               [get]
+                                                [/apis]                                []               [get]
+                                                [/healthz]                             []               [get]
+                                                [/healthz]                             []               [get]
+                                                [/livez]                               []               [get]
+                                                [/livez]                               []               [get]
+                                                [/openapi/*]                           []               [get]
+                                                [/openapi]                             []               [get]
+                                                [/openid/v1/jwks/]                     []               [get]
+                                                [/openid/v1/jwks]                      []               [get]
+                                                [/readyz]                              []               [get]
+                                                [/readyz]                              []               [get]
+                                                [/version/]                            []               [get]
+                                                [/version/]                            []               [get]
+                                                [/version]                             []               [get]
+                                                [/version]                             []               [get]
+
+=== point checks ===
+create  services       yes
+create  pods           no
+create  secrets        no
+create  configmaps     no
+create  deployments    no
+create  daemonsets     no
+get     services       no
+get     pods           no
+get     secrets        no
+get     configmaps     no
+get     deployments    no
+get     daemonsets     no
+list    services       no
+list    pods           no
+list    secrets        no
+list    configmaps     no
+list    deployments    no
+list    daemonsets     no
+delete  services       no
+delete  pods           no
+delete  secrets        no
+delete  configmaps     no
+delete  deployments    no
+delete  daemonsets     no
+
+=== cross-namespace (customer) ===
+create  services   customer: no
+create  pods       customer: no
+create  secrets    customer: no
+get     services   customer: no
+get     pods       customer: no
+get     secrets    customer: no
+list    services   customer: no
+list    pods       customer: no
+list    secrets    customer: no
+
+=== cluster-scoped ===
+no

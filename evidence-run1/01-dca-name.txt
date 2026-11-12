@@ -1,0 +1,2 @@
+deployment.apps/datadog-agent-cluster-agent
+deployment.apps/datadog-agent-operator

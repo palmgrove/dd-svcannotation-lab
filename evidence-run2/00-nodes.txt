@@ -1,0 +1,3 @@
+NAME                      STATUS     ROLES           AGE   VERSION   INTERNAL-IP   EXTERNAL-IP   OS-IMAGE                         KERNEL-VERSION     CONTAINER-RUNTIME
+dd-svcann-control-plane   Ready      control-plane   22s   v1.32.0   172.18.0.3    <none>        Debian GNU/Linux 12 (bookworm)   7.0.0-1019-azure   containerd://1.7.24
+dd-svcann-worker          NotReady   <none>          7s    v1.32.0   172.18.0.2    <none>        Debian GNU/Linux 12 (bookworm)   7.0.0-1019-azure   containerd://1.7.24

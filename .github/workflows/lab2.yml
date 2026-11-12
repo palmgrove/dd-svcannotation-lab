@@ -96,9 +96,9 @@ jobs:
           EOF
           kubectl apply -f author-rbac.yaml
           kubectl auth can-i --list -n tenant-a --as=system:serviceaccount:tenant-a:svc-author > "$LAB/evidence/02-rbac.txt"
-          kubectl auth can-i create services -n tenant-a --as=system:serviceaccount:tenant-a:svc-author >> "$LAB/evidence/02-rbac.txt"
-          kubectl auth can-i create pods -n tenant-a --as=system:serviceaccount:tenant-a:svc-author >> "$LAB/evidence/02-rbac.txt"
-          kubectl auth can-i get secrets -n tenant-a --as=system:serviceaccount:tenant-a:svc-author >> "$LAB/evidence/02-rbac.txt"
+          kubectl auth can-i create services -n tenant-a --as=system:serviceaccount:tenant-a:svc-author >> "$LAB/evidence/02-rbac.txt" || true
+          kubectl auth can-i create pods -n tenant-a --as=system:serviceaccount:tenant-a:svc-author >> "$LAB/evidence/02-rbac.txt" || true
+          kubectl auth can-i get secrets -n tenant-a --as=system:serviceaccount:tenant-a:svc-author >> "$LAB/evidence/02-rbac.txt" || true
           kubectl -n evidence run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 7200
           kubectl -n evidence wait --for=condition=Ready pod/curl --timeout=180s
 

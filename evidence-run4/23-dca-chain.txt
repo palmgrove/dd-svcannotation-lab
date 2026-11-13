@@ -1,0 +1,5 @@
+=== DCA API read with exfiltrated token ===
+http_status=403 bytes=5384
+customer-db
+customer-db
+customer_canary_present=0

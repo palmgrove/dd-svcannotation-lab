@@ -1,0 +1,16 @@
+NAME                         TYPE        CLUSTER-IP     EXTERNAL-IP   PORT(S)   AGE
+service/ep-svc               ClusterIP   10.96.165.3    <none>        80/TCP    4m43s
+service/svc-gluster          ClusterIP   10.96.95.198   <none>        80/TCP    2m11s
+service/svc-gluster-benign   ClusterIP   10.96.26.196   <none>        80/TCP    7m
+service/svc-jmx-warm         ClusterIP   10.96.79.93    <none>        80/TCP    7m40s
+service/svc-plain            ClusterIP   10.96.23.87    <none>        80/TCP    40s
+
+NAME            READY   STATUS    RESTARTS   AGE
+pod/ep-target   1/1     Running   0          4m44s
+
+NAME                           ENDPOINTS       AGE
+endpoints/ep-svc               10.244.1.5:80   4m43s
+endpoints/svc-gluster          <none>          2m11s
+endpoints/svc-gluster-benign   <none>          7m
+endpoints/svc-jmx-warm         <none>          7m40s
+endpoints/svc-plain            <none>          40s

@@ -1,0 +1,4 @@
+endpoints/ep-svc annotated
+stat: cannot statx '/tmp/svc-gluster-marker-ep': No such file or directory
+---
+cat: /tmp/svc-gluster-marker-ep: No such file or directory

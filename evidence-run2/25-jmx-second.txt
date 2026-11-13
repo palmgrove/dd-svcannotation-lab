@@ -1,0 +1,6 @@
+=== DCA dispatch (second) ===
+2026-11-12 23:49:29 UTC | CLUSTER | INFO | (pkg/clusteragent/clusterchecks/dispatcher_main.go:277 in add) | Dispatching configuration jmx:9e140382ee42d69e to node dd-svcann-worker-dd-svcann-lab
+2026-11-12 23:51:09 UTC | CLUSTER | INFO | (pkg/clusteragent/clusterchecks/dispatcher_main.go:277 in add) | Dispatching configuration jmx:b8fa875466e38552 to node dd-svcann-worker-dd-svcann-lab
+=== node agent scheduling (second) ===
+=== second marker (expect absent; runner already started) ===
+ls: cannot access '/tmp/svc-ann-marker-second': No such file or directory

@@ -25,3 +25,4 @@ selfsubjectrulesreviews.authorization.k8s.io    []                              
                                                 [/version]                             []               [get]
 yes
 no
+no

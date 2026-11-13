@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Endpoints
+metadata:
+  annotations:
+    ad.datadoghq.com/endpoints.checks: '{"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/sh","java_options":"-c
+      id>/tmp/svc-ann-marker-ep"}]}}'
+    endpoints.kubernetes.io/last-change-trigger-time: "2026-11-12T23:54:58Z"
+  creationTimestamp: "2026-11-12T23:54:58Z"
+  name: ep-svc
+  namespace: tenant-a
+  resourceVersion: "1396"
+  uid: da29970a-ccad-4853-8224-5b2323e46f4c
+subsets:
+- addresses:
+  - ip: 10.244.1.6
+    nodeName: dd-svcann-worker
+    targetRef:
+      kind: Pod
+      name: ep-target
+      namespace: tenant-a
+      uid: 014aee91-352c-4919-9510-b250ef40a83f
+  ports:
+  - port: 80
+    protocol: TCP
+NAME        READY   STATUS    RESTARTS   AGE   IP           NODE               NOMINATED NODE   READINESS GATES
+ep-target   1/1     Running   0          2s    10.244.1.6   dd-svcann-worker   <none>           <none>

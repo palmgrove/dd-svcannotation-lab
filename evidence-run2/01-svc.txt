@@ -1,0 +1,4 @@
+NAME                                               TYPE        CLUSTER-IP    EXTERNAL-IP   PORT(S)             AGE
+datadog-agent                                      ClusterIP   10.96.9.51    <none>        8125/UDP,8126/TCP   47s
+datadog-agent-cluster-agent                        ClusterIP   10.96.34.80   <none>        5005/TCP            47s
+datadog-agent-cluster-agent-admission-controller   ClusterIP   10.96.35.98   <none>        443/TCP             47s

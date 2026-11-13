@@ -1,1 +1,2 @@
-Error from server (NotFound): pods "curl" not found
+invalid session token
+{"not_running":"","warmup":false,"nodes":[{"name":"dd-svcann-worker-dd-svcann-lab","configs":[]}],"dangling":[]}

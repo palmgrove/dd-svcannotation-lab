@@ -1,0 +1,18 @@
+=== DCA dispatch (endpoints jmx) ===
+2026-11-12 23:52:25 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+2026-11-12 23:52:25 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+2026-11-12 23:52:26 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+2026-11-12 23:52:55 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+2026-11-12 23:53:19 UTC | CLUSTER | INFO | (pkg/clusteragent/clusterchecks/dispatcher_main.go:277 in add) | Dispatching configuration jmx:9d166ba65c1a9e5c to node dd-svcann-worker-dd-svcann-lab
+2026-11-12 23:54:56 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 2177c6da-58f1-468b-9b9c-5e0200f30216 not found, not removing
+2026-11-12 23:54:58 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+2026-11-12 23:54:58 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+2026-11-12 23:54:59 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+2026-11-12 23:55:29 UTC | CLUSTER | DEBUG | (comp/core/autodiscovery/listeners/kube_endpointslices.go:296 in removeServiceFromSlice) | EndpointSlice 5684d9e5-af43-4a10-a162-c45989cddbed not found, not removing
+
+=== node agent JMX log ===
+
+=== marker (endpoints annotation) ===
+ls: cannot access '/tmp/svc-ann-marker-ep': No such file or directory
+---
+cat: /tmp/svc-ann-marker-ep: No such file or directory

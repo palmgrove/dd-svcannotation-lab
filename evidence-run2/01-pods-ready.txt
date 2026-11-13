@@ -1,0 +1,4 @@
+NAME                                           READY   STATUS    RESTARTS   AGE   IP           NODE                      NOMINATED NODE   READINESS GATES
+datadog-agent-8bbwq                            3/3     Running   0          46s   10.244.1.3   dd-svcann-worker          <none>           <none>
+datadog-agent-cluster-agent-566559c5dd-thtqk   1/1     Running   0          46s   10.244.0.5   dd-svcann-control-plane   <none>           <none>
+datadog-agent-operator-676499d5f-5r2cz         1/1     Running   0          46s   10.244.1.4   dd-svcann-worker          <none>           <none>
